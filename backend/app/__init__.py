@@ -1,0 +1,1 @@
+"""PokéFolio backend application."""
