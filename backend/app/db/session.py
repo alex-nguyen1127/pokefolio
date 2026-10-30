@@ -1,6 +1,7 @@
 """Shared synchronous engine and session factory."""
 
 import os
+from collections.abc import Iterator
 from functools import lru_cache
 from pathlib import Path
 
@@ -32,3 +33,9 @@ def get_session_factory() -> sessionmaker[Session]:
         hide_parameters=True,
     )
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+def get_session() -> Iterator[Session]:
+    """Provide a request session and close it on success or failure."""
+    with get_session_factory()() as session:
+        yield session
