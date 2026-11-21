@@ -1,5 +1,7 @@
 """API tests against isolated SQLite; never connect to PostgreSQL."""
 
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import unittest
 from decimal import Decimal
 from unittest.mock import patch
@@ -10,14 +12,18 @@ from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+from app.core.config import SESSION_COOKIE_NAME
 from app.db.base import Base
 from app.db.session import get_session
 from app.main import app
-from app.models import Card, Transaction, User
+from app.models import Card, Transaction, User, Session as AuthSession
 
 
 class PortfolioApiTests(unittest.TestCase):
     def setUp(self) -> None:
+        csrf_env = patch.dict("os.environ", {"POKEFOLIO_TRUSTED_ORIGINS": "http://localhost:3000"})
+        csrf_env.start()
+        self.addCleanup(csrf_env.stop)
         self.engine = create_engine(
             "sqlite+pysqlite:///:memory:",
             connect_args={"check_same_thread": False},
@@ -39,6 +45,15 @@ class PortfolioApiTests(unittest.TestCase):
             ])
             session.commit()
 
+        self.tokens = {self.user_id: "synthetic-first-session", self.other_user_id: "synthetic-second-session"}
+        with Session(self.engine) as session:
+            for user_id, token in self.tokens.items():
+                session.add(AuthSession(
+                    user_id=user_id, token_hash=sha256(token.encode()).hexdigest(),
+                    expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+                ))
+            session.commit()
+
         def isolated_session():
             with Session(self.engine, autoflush=False) as session:
                 yield session
@@ -53,8 +68,13 @@ class PortfolioApiTests(unittest.TestCase):
         )
         factory_guard.start()
         self.addCleanup(factory_guard.stop)
-        self.client = TestClient(app)
+        self.client = TestClient(app, headers={"Origin": "http://localhost:3000"})
         self.addCleanup(self.client.close)
+        self.authenticate(self.user_id)
+
+    def authenticate(self, user_id):
+        self.client.cookies.clear()
+        self.client.cookies.set(SESSION_COOKIE_NAME, self.tokens[user_id])
 
     def test_successful_retrieval_is_scoped_to_user(self) -> None:
         with Session(self.engine) as session:
@@ -80,8 +100,8 @@ class PortfolioApiTests(unittest.TestCase):
 
     def test_unknown_user(self) -> None:
         response = self.client.get(f"/users/{uuid4()}/holdings")
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json(), {"detail": "User not found"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json(), {"detail": "Forbidden"})
 
     def test_malformed_uuid(self) -> None:
         response = self.client.get("/users/not-a-uuid/holdings")
@@ -159,7 +179,9 @@ class PortfolioApiTests(unittest.TestCase):
         })
 
     def test_other_users_holdings_cannot_be_sold(self) -> None:
+        self.authenticate(self.other_user_id)
         self.assertEqual(self.post_transaction(user_id=self.other_user_id).status_code, 201)
+        self.authenticate(self.user_id)
         self.assertEqual(self.post_transaction(type="SELL", quantity=1).status_code, 409)
         self.assertEqual(self.transaction_count(), 1)
         self.assertEqual(self.client.get(f"/users/{self.user_id}/holdings").json(),
@@ -176,8 +198,8 @@ class PortfolioApiTests(unittest.TestCase):
 
     def test_missing_transaction_user_or_card(self) -> None:
         response = self.post_transaction(user_id=uuid4())
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json(), {"detail": "User not found"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json(), {"detail": "Forbidden"})
         response = self.post_transaction(card_id="missing")
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json(), {"detail": "Card not found"})
@@ -272,6 +294,7 @@ class PortfolioApiTests(unittest.TestCase):
             self.assertIn("created_at", item)
             self.assertIn("transacted_at", item)
         self.assertEqual(body["transactions"][1]["type"], "SELL")
+        self.authenticate(self.other_user_id)
         other = self.client.get(f"/users/{self.other_user_id}/transactions").json()
         self.assertEqual(other["total"], 1)
         self.assertEqual(other["transactions"][0]["user_id"], str(self.other_user_id))
@@ -330,8 +353,89 @@ class PortfolioApiTests(unittest.TestCase):
 
     def test_history_unknown_user_and_malformed_uuid(self) -> None:
         response = self.client.get(f"/users/{uuid4()}/transactions")
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json(), {"detail": "User not found"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json(), {"detail": "Forbidden"})
         response = self.client.get("/users/not-a-uuid/transactions")
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["detail"][0]["loc"], ["path", "user_id"])
+
+
+    def portfolio_requests(self, user_id):
+        return [
+            self.client.get(f"/users/{user_id}/holdings"),
+            self.post_transaction(user_id=user_id),
+            self.client.get(f"/users/{user_id}/transactions"),
+        ]
+
+    def test_unauthenticated_and_invalid_sessions_never_reach_services(self):
+        for state in ("missing", "unknown", "expired", "revoked"):
+            with self.subTest(state=state):
+                self.client.cookies.clear()
+                if state == "unknown":
+                    self.client.cookies.set(SESSION_COOKIE_NAME, "synthetic-unknown-session")
+                elif state != "missing":
+                    self.authenticate(self.user_id)
+                    with Session(self.engine) as session:
+                        saved = session.scalar(select(AuthSession).where(AuthSession.user_id == self.user_id))
+                        saved.expires_at = datetime.now(timezone.utc) + timedelta(days=1)
+                        saved.revoked_at = None
+                        if state == "expired":
+                            saved.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+                        else:
+                            saved.revoked_at = datetime.now(timezone.utc)
+                        session.commit()
+                with patch("app.api.routes.portfolio.get_user_holdings") as holdings, \
+                     patch("app.api.routes.portfolio.create_transaction") as create, \
+                     patch("app.api.routes.portfolio.get_user_transactions") as history:
+                    for response in self.portfolio_requests(self.user_id):
+                        self.assertEqual(response.status_code, 401)
+                        self.assertEqual(response.json(), {"detail": "Not authenticated"})
+                    holdings.assert_not_called()
+                    create.assert_not_called()
+                    history.assert_not_called()
+                self.assertEqual(self.transaction_count(), 0)
+
+    def test_cross_user_requests_are_forbidden_before_services(self):
+        with patch("app.api.routes.portfolio.get_user_holdings") as holdings, \
+             patch("app.api.routes.portfolio.create_transaction") as create, \
+             patch("app.api.routes.portfolio.get_user_transactions") as history:
+            for owner, target in ((self.user_id, self.other_user_id),
+                                  (self.other_user_id, self.user_id),
+                                  (self.user_id, uuid4())):
+                self.authenticate(owner)
+                for response in self.portfolio_requests(target):
+                    self.assertEqual(response.status_code, 403)
+                    self.assertEqual(response.json(), {"detail": "Forbidden"})
+            holdings.assert_not_called()
+            create.assert_not_called()
+            history.assert_not_called()
+        self.assertEqual(self.transaction_count(), 0)
+
+    def test_request_body_cannot_override_authenticated_identity(self):
+        response = self.post_transaction(user_id=self.other_user_id, quantity=1)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.transaction_count(), 0)
+        # Unknown fields retain the existing schema behavior, but cannot select
+        # a different owner for an otherwise valid transaction.
+        response = self.client.post(f"/users/{self.user_id}/transactions", json={
+            "user_id": str(self.other_user_id), "card_id": "brs-154", "type": "BUY",
+            "quantity": 1, "price_per_unit": "1.00",
+        })
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["user_id"], str(self.user_id))
+        with Session(self.engine) as session:
+            rows = session.scalars(select(Transaction)).all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].user_id, self.user_id)
+
+    def test_authenticated_write_service_receives_idle_session_and_owner(self):
+        from app.services.transactions import create_transaction
+
+        def checked_create(session, user_id, data):
+            self.assertFalse(session.in_transaction())
+            self.assertEqual(user_id, self.user_id)
+            return create_transaction(session, user_id, data)
+
+        with patch("app.api.routes.portfolio.create_transaction", side_effect=checked_create):
+            self.assertEqual(self.post_transaction().status_code, 201)
+        self.assertEqual(self.transaction_count(), 1)

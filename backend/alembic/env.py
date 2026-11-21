@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, pool
 from sqlalchemy.engine import make_url
 
 from app.db.base import Base
-from app.models import Card, Transaction, User  # noqa: F401 -- register with Base.metadata
+from app.models import Card, Session, Transaction, User  # noqa: F401 -- register with Base.metadata
 
 config = context.config
 if config.config_file_name is not None:
